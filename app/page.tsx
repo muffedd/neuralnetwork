@@ -9,6 +9,14 @@ import {
   type KnowledgeGraph,
   type KnowledgeNode,
 } from "./document-graph";
+import {
+  fallbackQuestion,
+  updateWeaknessProfile,
+  weakestErrorTypes,
+  type AdaptiveQuestion,
+  type NodeProgress,
+  type WeaknessProfile,
+} from "./learning-engine";
 
 const DEMO_NODES: KnowledgeNode[] = [
   { id: "topic", label: "Photosynthesis", kind: "topic", x: 0, y: 0, z: 0, note: "Central topic identified from the document." },
@@ -52,6 +60,65 @@ type FieldPoint = { x: number; y: number; z: number; anchor: string; size: numbe
 type DocumentPreview =
   | { type: "pdf"; url: string; name: string }
   | { type: "docx"; html: string; name: string };
+type QuizSession = {
+  nodeId: string;
+  attempt: number;
+  question: AdaptiveQuestion;
+};
+type QuizOutcome = "retry" | "mastered" | "fragile" | null;
+
+function splitDocumentText(text: string): string[] {
+  const normalized = text.replace(/\r/g, "").replace(/\u0000/g, " ").trim();
+  if (!normalized) return [];
+  const blocks = normalized
+    .replace(/(\[PAGE \d+\])/g, "\n\n$1\n\n")
+    .split(/\n{2,}/)
+    .map((block) => block.replace(/\n+/g, " ").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const paragraphs: string[] = [];
+  blocks.forEach((block) => {
+    if (block.length <= 680 || /^\[PAGE \d+\]$/.test(block)) {
+      paragraphs.push(block);
+      return;
+    }
+    const sentences = block.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [block];
+    let paragraph = "";
+    sentences.forEach((sentence) => {
+      if (paragraph && paragraph.length + sentence.length > 540) {
+        paragraphs.push(paragraph.trim());
+        paragraph = "";
+      }
+      paragraph += `${sentence.trim()} `;
+    });
+    if (paragraph.trim()) paragraphs.push(paragraph.trim());
+  });
+  return paragraphs;
+}
+
+const READER_STOP_WORDS = new Set(
+  "about after also and are because been before being between both but can could does for from has have into its more most not only other over same should such than that the their them then there these they this those through under very was were what when where which while will with would".split(" "),
+);
+
+function findEvidenceParagraph(node: KnowledgeNode, paragraphs: string[], fallback: number) {
+  const source = `${node.label} ${node.evidence || ""} ${node.memoryNote || ""} ${node.note || ""}`
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, " ");
+  const tokens = [...new Set(source.split(/\s+/).filter((token) => token.length > 3 && !READER_STOP_WORDS.has(token)))];
+  if (!tokens.length) return fallback;
+  let bestIndex = fallback;
+  let bestScore = 0;
+  paragraphs.forEach((paragraph, index) => {
+    if (/^\[PAGE \d+\]$/.test(paragraph)) return;
+    const candidate = paragraph.toLowerCase();
+    const matches = tokens.filter((token) => candidate.includes(token)).length;
+    const score = matches / tokens.length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  });
+  return bestScore >= .12 ? bestIndex : fallback;
+}
 
 function makeField(nodes: KnowledgeNode[]): FieldPoint[] {
   let seed = nodes.reduce((sum, node) => sum + node.label.charCodeAt(0), 7419);
@@ -82,6 +149,8 @@ export default function Home() {
   const wrapRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const previewUrlRef = useRef<string | null>(null);
+  const readerScrollRef = useRef<HTMLDivElement>(null);
+  const questionStartedAt = useRef(0);
   const rotation = useRef({ x: -.12, y: -.08 });
   const zoom = useRef(1);
   const drag = useRef({ active: false, x: 0, y: 0 });
@@ -98,45 +167,120 @@ export default function Home() {
   const [analysisMode, setAnalysisMode] = useState<"demo" | "gemini">("demo");
   const [lastFile, setLastFile] = useState<File | null>(null);
   const [documentPreview, setDocumentPreview] = useState<DocumentPreview | null>(null);
+  const [documentText, setDocumentText] = useState("");
   const [readerOpen, setReaderOpen] = useState(false);
   const [flashcardId, setFlashcardId] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
+  const [nodeProgress, setNodeProgress] = useState<Record<string, NodeProgress>>({});
+  const [weaknessProfile, setWeaknessProfile] = useState<WeaknessProfile>({});
+  const [quiz, setQuiz] = useState<QuizSession | null>(null);
+  const [quizLoading, setQuizLoading] = useState("");
+  const [selectedAnswer, setSelectedAnswer] = useState<number | null>(null);
+  const [quizOutcome, setQuizOutcome] = useState<QuizOutcome>(null);
+  const learningNodes = useMemo(() => {
+    const ordered: KnowledgeNode[] = [];
+    const seen = new Set<string>();
+    graph.nodes.filter((node) => node.kind === "branch").forEach((branch) => {
+      ordered.push(branch);
+      seen.add(branch.id);
+      graph.edges
+        .filter((edge) => edge.from === branch.id)
+        .forEach((edge) => {
+          const node = graph.nodes.find((candidate) => candidate.id === edge.to);
+          if (node && node.kind !== "topic" && !seen.has(node.id)) {
+            ordered.push(node);
+            seen.add(node.id);
+          }
+        });
+    });
+    graph.nodes.forEach((node) => {
+      if (node.kind !== "topic" && !seen.has(node.id)) ordered.push(node);
+    });
+    return ordered;
+  }, [graph]);
+  const progressionEnabled = analysisMode === "gemini" && Boolean(documentText);
+  const availableNodes = useMemo(
+    () => progressionEnabled
+      ? graph.nodes.filter((node) => node.id === "topic" || Boolean(nodeProgress[node.id]))
+      : graph.nodes,
+    [graph.nodes, nodeProgress, progressionEnabled],
+  );
+  const availableNodeIds = useMemo(() => new Set(availableNodes.map((node) => node.id)), [availableNodes]);
   const visibleEdges = useMemo(() => {
-    if (!focusId) return graph.edges;
-    const direct = graph.edges.filter((edge) => edge.from === focusId || edge.to === focusId);
+    const availableEdges = graph.edges.filter((edge) => availableNodeIds.has(edge.from) && availableNodeIds.has(edge.to));
+    if (!focusId) return availableEdges;
+    const direct = availableEdges.filter((edge) => edge.from === focusId || edge.to === focusId);
     const ids = new Set([focusId, ...direct.flatMap((edge) => [edge.from, edge.to])]);
-    return graph.edges.filter((edge) => ids.has(edge.from) && ids.has(edge.to));
-  }, [focusId, graph.edges]);
+    return availableEdges.filter((edge) => ids.has(edge.from) && ids.has(edge.to));
+  }, [availableNodeIds, focusId, graph.edges]);
   const visibleNodes = useMemo(() => {
-    if (!focusId) return graph.nodes;
+    if (!focusId) return availableNodes;
     const ids = new Set([focusId, ...visibleEdges.flatMap((edge) => [edge.from, edge.to])]);
-    return graph.nodes.filter((node) => ids.has(node.id));
-  }, [focusId, graph.nodes, visibleEdges]);
+    return availableNodes.filter((node) => ids.has(node.id));
+  }, [availableNodes, focusId, visibleEdges]);
   const focusNode = useMemo(
     () => graph.nodes.find((node) => node.id === focusId) ?? null,
     [focusId, graph.nodes],
   );
   const fieldPoints = useMemo(() => makeField(visibleNodes), [visibleNodes]);
   const selectedNode = useMemo(
-    () => visibleNodes.find((node) => node.id === selected) ?? visibleNodes[0],
+    () => visibleNodes.find((node) => node.id === selected) ?? visibleNodes[0] ?? graph.nodes[0],
     [selected, visibleNodes],
   );
   const canFocusSelected = useMemo(
-    () => graph.edges.some((edge) => edge.from === selectedNode.id || edge.to === selectedNode.id),
-    [graph.edges, selectedNode.id],
+    () => Boolean(selectedNode) && visibleEdges.some((edge) => edge.from === selectedNode.id || edge.to === selectedNode.id),
+    [selectedNode, visibleEdges],
   );
   const studyNodes = useMemo(
-    () => graph.nodes.filter((node) => node.kind === "concept" || node.kind === "bridge"),
-    [graph.nodes],
+    () => availableNodes.filter((node) => node.kind === "concept" || node.kind === "bridge"),
+    [availableNodes],
   );
   const flashcardNode = useMemo(
     () => studyNodes.find((node) => node.id === flashcardId) ?? null,
     [flashcardId, studyNodes],
   );
+  const readerParagraphs = useMemo(() => splitDocumentText(documentText), [documentText]);
+  const checkpointsByParagraph = useMemo(() => {
+    const checkpoints = new Map<number, KnowledgeNode[]>();
+    if (!readerParagraphs.length || !learningNodes.length) return checkpoints;
+    let lastPosition = 0;
+    learningNodes.forEach((node, index) => {
+      const fallback = Math.min(
+        readerParagraphs.length - 1,
+        Math.max(0, Math.floor(((index + 1) / (learningNodes.length + 1)) * readerParagraphs.length)),
+      );
+      const position = Math.max(lastPosition, findEvidenceParagraph(node, readerParagraphs, fallback));
+      lastPosition = position;
+      checkpoints.set(position, [...(checkpoints.get(position) ?? []), node]);
+    });
+    return checkpoints;
+  }, [learningNodes, readerParagraphs.length]);
+  const completedCount = useMemo(
+    () => learningNodes.filter((node) => Boolean(nodeProgress[node.id])).length,
+    [learningNodes, nodeProgress],
+  );
 
   useEffect(() => () => {
     if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
   }, []);
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("knowledge-galaxy-weakness-v1");
+      if (saved) setWeaknessProfile(JSON.parse(saved) as WeaknessProfile);
+    } catch {
+      // A private learner profile is optional; the study flow works without storage.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!Object.keys(weaknessProfile).length) return;
+    try {
+      window.localStorage.setItem("knowledge-galaxy-weakness-v1", JSON.stringify(weaknessProfile));
+    } catch {
+      // Storage can be disabled; keep the in-memory learner model active.
+    }
+  }, [weaknessProfile]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -246,15 +390,17 @@ export default function Home() {
         const point = points.get(node.id);
         if (!point) return;
         const active = selected === node.id;
+        const fragile = nodeProgress[node.id] === "fragile";
+        const nodeColor = fragile ? quietInk : nodeInk;
         ctx.save();
-        ctx.shadowColor = nodeInk;
-        ctx.shadowBlur = active ? 9 : Math.max(0, 3 - point.z / 90);
-        ctx.fillStyle = nodeInk;
+        ctx.shadowColor = nodeColor;
+        ctx.shadowBlur = fragile ? 1 : active ? 9 : Math.max(0, 3 - point.z / 90);
+        ctx.fillStyle = nodeColor;
         ctx.beginPath();
         ctx.arc(point.x, point.y, active ? point.r * 1.18 : point.r, 0, Math.PI * 2);
         ctx.fill();
         if (node.kind === "bridge") {
-          ctx.strokeStyle = nodeInk;
+          ctx.strokeStyle = nodeColor;
           ctx.lineWidth = .7;
           ctx.setLineDash([2, 3]);
           ctx.beginPath();
@@ -262,7 +408,7 @@ export default function Home() {
           ctx.stroke();
         }
         ctx.restore();
-        ctx.fillStyle = active ? nodeInk : quietInk;
+        ctx.fillStyle = fragile ? quietInk : active ? nodeInk : quietInk;
         ctx.font = `${active ? 650 : 500} ${node.kind === "topic" ? 12 : 9}px Helvetica, "Helvetica Neue", Arial, sans-serif`;
         ctx.textAlign = "left";
         ctx.textBaseline = "top";
@@ -271,7 +417,7 @@ export default function Home() {
       });
 
     projected.current = new Map([...points].map(([id, point]) => [id, { x: point.x, y: point.y, r: Math.max(15, point.r + 8) }]));
-  }, [fieldPoints, focusNode, mode, selected, theme, visibleEdges, visibleNodes]);
+  }, [fieldPoints, focusNode, mode, nodeProgress, selected, theme, visibleEdges, visibleNodes]);
 
   useEffect(() => {
     draw();
@@ -288,6 +434,8 @@ export default function Home() {
     }
     setError("");
     setLastFile(file);
+    setDocumentText("");
+    setNodeProgress({});
     setProcessing("Reading document…");
     try {
       if (previewUrlRef.current) {
@@ -314,6 +462,7 @@ export default function Home() {
         });
       }
       const text = await extractDocumentText(file);
+      setDocumentText(text);
       if (text.trim().length < 80) throw new Error("This document contains too little selectable text. Scanned PDFs need OCR first.");
       setProcessing("Gemini is mapping topics…");
       const response = await fetch("/api/analyze", {
@@ -332,6 +481,10 @@ export default function Home() {
       setSelected("topic");
       setFocusId(null);
       setFlashcardId(null);
+      setNodeProgress({ topic: "mastered" });
+      setQuiz(null);
+      setSelectedAnswer(null);
+      setQuizOutcome(null);
       setFileName(file.name);
       rotation.current = { x: -.12, y: -.08 };
       zoom.current = nextGraph.nodes.length > 35 ? .8 : 1;
@@ -388,6 +541,124 @@ export default function Home() {
     setSelected(next.id);
   };
 
+  const jumpToNode = (nodeId: string) => {
+    setSelected(nodeId);
+    if (nodeId === "topic") {
+      readerScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    const marker = readerScrollRef.current?.querySelector<HTMLElement>(
+      `[data-checkpoint-id="${CSS.escape(nodeId)}"]`,
+    );
+    marker?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const requestAdaptiveQuestion = async (
+    node: KnowledgeNode,
+    attempt: number,
+    previousQuestion = "",
+    profile = weaknessProfile,
+  ) => {
+    const errorType = weakestErrorTypes(profile)[0];
+    const distractorNodes = learningNodes.filter((candidate) => candidate.id !== node.id);
+    setQuizLoading(node.label);
+    try {
+      const response = await fetch("/api/question", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          node: {
+            label: node.label,
+            evidence: node.evidence || node.note,
+            memoryNote: node.memoryNote || node.note,
+          },
+          distractors: distractorNodes
+            .map((candidate) => candidate.memoryNote || candidate.evidence || candidate.note)
+            .slice(0, 5),
+          errorType,
+          attempt,
+          previousQuestion,
+        }),
+      });
+      const result = await response.json() as { question?: AdaptiveQuestion };
+      const question = response.ok && result.question
+        ? result.question
+        : fallbackQuestion(node, distractorNodes, errorType);
+      setQuiz({ nodeId: node.id, attempt, question });
+      setSelectedAnswer(null);
+      setQuizOutcome(null);
+      questionStartedAt.current = Date.now();
+    } catch {
+      setQuiz({
+        nodeId: node.id,
+        attempt,
+        question: fallbackQuestion(node, distractorNodes, errorType),
+      });
+      setSelectedAnswer(null);
+      setQuizOutcome(null);
+      questionStartedAt.current = Date.now();
+    } finally {
+      setQuizLoading("");
+    }
+  };
+
+  const beginCheckpoint = (node: KnowledgeNode) => {
+    const nextLocked = learningNodes.find((candidate) => !nodeProgress[candidate.id]);
+    if (!progressionEnabled || quiz || quizLoading || !nextLocked || nextLocked.id !== node.id) return;
+    void requestAdaptiveQuestion(node, 1);
+  };
+
+  const onReaderScroll = () => {
+    const container = readerScrollRef.current;
+    const nextLocked = learningNodes.find((node) => !nodeProgress[node.id]);
+    if (!container || !nextLocked || quiz || quizLoading) return;
+    const marker = container.querySelector<HTMLElement>(
+      `[data-checkpoint-id="${CSS.escape(nextLocked.id)}"]`,
+    );
+    if (!marker) return;
+    const containerTop = container.getBoundingClientRect().top;
+    const markerTop = marker.getBoundingClientRect().top;
+    if (markerTop <= containerTop + container.clientHeight * .72) beginCheckpoint(nextLocked);
+  };
+
+  const answerQuestion = (answerIndex: number) => {
+    if (!quiz || selectedAnswer !== null) return;
+    const correct = answerIndex === quiz.question.correctIndex;
+    const latency = Math.max(400, Date.now() - questionStartedAt.current);
+    const nextProfile = updateWeaknessProfile(
+      weaknessProfile,
+      quiz.question.errorType,
+      correct,
+      latency,
+    );
+    setWeaknessProfile(nextProfile);
+    setSelectedAnswer(answerIndex);
+    if (correct) {
+      setNodeProgress((current) => ({ ...current, [quiz.nodeId]: "mastered" }));
+      setSelected(quiz.nodeId);
+      setQuizOutcome("mastered");
+    } else if (quiz.attempt >= 3) {
+      setNodeProgress((current) => ({ ...current, [quiz.nodeId]: "fragile" }));
+      setSelected(quiz.nodeId);
+      setQuizOutcome("fragile");
+    } else {
+      setQuizOutcome("retry");
+    }
+  };
+
+  const retryCheckpoint = () => {
+    if (!quiz) return;
+    const node = graph.nodes.find((candidate) => candidate.id === quiz.nodeId);
+    if (!node) return;
+    void requestAdaptiveQuestion(node, quiz.attempt + 1, quiz.question.prompt, weaknessProfile);
+  };
+
+  const closeCheckpoint = () => {
+    setQuiz(null);
+    setSelectedAnswer(null);
+    setQuizOutcome(null);
+  };
+
   return (
     <main
       className={`shell ${theme} ${draggingFile ? "file-dragging" : ""}`}
@@ -401,14 +672,14 @@ export default function Home() {
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark" />
-          <div><strong>Knowledge Galaxy</strong><span>closed-document concept map</span></div>
+          <div><strong>Knowledge Galaxy</strong><span>read · retrieve · unlock</span></div>
         </div>
         <div className="top-actions">
           {studyNodes.length > 0 && analysisMode === "gemini" && (
             <button className="study-small" onClick={() => openFlashcard(studyNodes[0])}>Study cards</button>
           )}
           {documentPreview && (
-            <button className="reader-small" onClick={() => setReaderOpen(true)}>Read document</button>
+            <button className="reader-small" onClick={() => setReaderOpen(true)}>Original file</button>
           )}
           <button className="upload-small" onClick={() => inputRef.current?.click()}>{fileName ? "Replace file" : "Upload document"}</button>
           <div className="theme-switch" aria-label="Colour mode">
@@ -421,9 +692,9 @@ export default function Home() {
 
       <section className="intro">
         <div>
-          <p className="eyebrow">{fileName ? "Document network generated" : "Your document becomes a memory map"}</p>
-          <h1>{fileName ? graph.title : <>See how ideas <em>connect.</em></>}</h1>
-          <p>{fileName ? `${graph.wordCount.toLocaleString()} words · ${graph.sectionCount} sections · ${graph.sharedCount} shared concepts · ${graph.semanticCount ?? 0} semantic links` : "Upload a PDF or DOCX. Gemini maps only the document text—no outside knowledge."}</p>
+          <p className="eyebrow">{fileName ? "Your network grows as you read" : "Your document becomes a memory quest"}</p>
+          <h1>{fileName ? graph.title : <>Read it. Recall it. <em>Unlock it.</em></>}</h1>
+          <p>{fileName ? `${completedCount}/${learningNodes.length} nodes unlocked · ${graph.wordCount.toLocaleString()} source words` : "Upload a PDF or DOCX. Start with one node, then grow the map by passing source-grounded checkpoints."}</p>
         </div>
         <button className="upload-primary" onClick={() => inputRef.current?.click()}>
           <span>+</span>{fileName ? "Analyze another document" : "Choose PDF or DOCX"}<small>Closed-document analysis</small>
@@ -465,9 +736,10 @@ export default function Home() {
                   const distance = Math.hypot(event.nativeEvent.offsetX - point.x, event.nativeEvent.offsetY - point.y);
                   if (distance < point.r && (!closest || distance < closest.distance)) closest = { id, distance };
                 });
-                if (closest) {
-                  const node = visibleNodes.find((candidate) => candidate.id === closest.id);
-                  if (node) openFlashcard(node);
+                const clicked = closest as { id: string; distance: number } | null;
+                if (clicked) {
+                  const node = visibleNodes.find((candidate) => candidate.id === clicked.id);
+                  if (node) jumpToNode(node.id);
                 }
               }
             }}
@@ -488,7 +760,7 @@ export default function Home() {
               draw();
             }}
           />
-          <div className="orbit-hint">DRAG TO ORBIT <span>·</span> SCROLL TO ZOOM <span>·</span> CLICK A NODE</div>
+          <div className="orbit-hint">DRAG TO ORBIT <span>·</span> SCROLL TO ZOOM <span>·</span> CLICK NODE TO JUMP IN THE READER</div>
           <div className="mode-switch" aria-label="Graph view">
             {focusId && <button className="back-map" onClick={exitFocus}>← Full map</button>}
             {(["all", "hierarchy", "bridges"] as const).map((item) => (
@@ -499,6 +771,7 @@ export default function Home() {
             <button className="reset" onClick={reset} aria-label="Reset graph view">↺</button>
           </div>
           {processing && <div className="processing"><i /><strong>{processing}</strong><span>The file stays local; extracted text is sent securely for analysis.</span></div>}
+          {quizLoading && <div className="processing checkpoint-loading"><i /><strong>Building a checkpoint</strong><span>Preparing a source-grounded question for {quizLoading}.</span></div>}
           {flashcardNode && (
             <div className="flashcard-layer" role="dialog" aria-label={`Memory card for ${flashcardNode.label}`}>
               <article className="flashcard">
@@ -516,13 +789,77 @@ export default function Home() {
                 )}
                 <footer>
                   <button onClick={() => moveFlashcard(-1)}>← Previous</button>
-                  {documentPreview && <button onClick={() => setReaderOpen(true)}>Read source</button>}
+                  {documentText && <button onClick={() => { setFlashcardId(null); jumpToNode(flashcardNode.id); }}>Jump to source</button>}
                   <button onClick={() => moveFlashcard(1)}>Next →</button>
                 </footer>
               </article>
             </div>
           )}
         </div>
+
+        <section className="reading-pane" aria-label="Document reading canvas">
+          <header className="reading-head">
+            <div>
+              <span>Reading canvas</span>
+              <strong>{fileName || "Upload a source to begin"}</strong>
+            </div>
+            {progressionEnabled && (
+              <div className="reading-progress">
+                <b>{completedCount}/{learningNodes.length}</b>
+                <span>nodes</span>
+              </div>
+            )}
+          </header>
+          <div className="progress-track" aria-hidden="true">
+            <i style={{ width: `${learningNodes.length ? (completedCount / learningNodes.length) * 100 : 0}%` }} />
+          </div>
+          <div className="reading-scroll" ref={readerScrollRef} onScroll={onReaderScroll}>
+            {readerParagraphs.length ? (
+              <article className="reading-document">
+                <div className="reading-cover">
+                  <span>Closed-document quest</span>
+                  <h2>{graph.title}</h2>
+                  <p>Read naturally. A checkpoint appears as you reach each marked passage; pass it to grow the network.</p>
+                </div>
+                {readerParagraphs.map((paragraph, index) => (
+                  <section className={/^\[PAGE \d+\]$/.test(paragraph) ? "page-marker" : "reading-paragraph"} key={`${index}-${paragraph.slice(0, 18)}`}>
+                    {(checkpointsByParagraph.get(index) ?? []).map((node) => {
+                      const status = nodeProgress[node.id];
+                      const nextLocked = learningNodes.find((candidate) => !nodeProgress[candidate.id]);
+                      return (
+                        <button
+                          className={`reader-checkpoint ${status || "locked"}`}
+                          data-checkpoint-id={node.id}
+                          key={node.id}
+                          onClick={() => status ? jumpToNode(node.id) : nextLocked?.id === node.id ? beginCheckpoint(node) : undefined}
+                        >
+                          <i />
+                          <span>{status === "mastered" ? "Unlocked" : status === "fragile" ? "Needs practice" : "Checkpoint"}</span>
+                          <b>{node.label}</b>
+                        </button>
+                      );
+                    })}
+                    {/^\[PAGE \d+\]$/.test(paragraph) ? <span>{paragraph.replace(/\[|\]/g, "")}</span> : <p>{paragraph}</p>}
+                  </section>
+                ))}
+              </article>
+            ) : (
+              <div className="reading-empty">
+                <span>01</span>
+                <h2>Your source becomes the path.</h2>
+                <p>Upload a PDF or DOCX. The readable text appears here while the network begins with only its central node.</p>
+                <button onClick={() => inputRef.current?.click()}>Choose document</button>
+              </div>
+            )}
+          </div>
+          {progressionEnabled && (
+            <footer className="adaptive-status">
+              <span>Adaptive focus</span>
+              <b>{weakestErrorTypes(weaknessProfile)[0].replace("-", " ")}</b>
+              <em>Private on this device</em>
+            </footer>
+          )}
+        </section>
 
         <aside className="inspector">
           {focusNode && (
@@ -537,6 +874,11 @@ export default function Home() {
             <span>{selectedNode.kind === "topic" ? "Main topic" : selectedNode.kind === "branch" ? "Subtopic" : selectedNode.kind === "bridge" ? "Shared concept" : "Supporting concept"}</span>
           </div>
           <h2>{selectedNode.label}</h2>
+          {progressionEnabled && selectedNode.id !== "topic" && (
+            <div className={`mastery-pill ${nodeProgress[selectedNode.id] || "locked"}`}>
+              {nodeProgress[selectedNode.id] === "mastered" ? "Mastered" : nodeProgress[selectedNode.id] === "fragile" ? "Needs practice" : "Locked"}
+            </div>
+          )}
           <p>{selectedNode.note}</p>
           {canFocusSelected && focusId !== selectedNode.id && (
             <button className="focus-action" onClick={focusSelected}>
@@ -553,7 +895,7 @@ export default function Home() {
             {visibleEdges.filter((edge) => edge.from === selectedNode.id || edge.to === selectedNode.id).map((edge, index) => {
               const other = visibleNodes.find((node) => node.id === (edge.from === selectedNode.id ? edge.to : edge.from));
               return (
-                <button key={`${edge.from}-${edge.to}-${index}`} onClick={() => other && openFlashcard(other)}>
+                <button key={`${edge.from}-${edge.to}-${index}`} onClick={() => other && jumpToNode(other.id)}>
                   <i /><b>{other?.label}</b><em>{edge.relation}</em>
                 </button>
               );
@@ -564,6 +906,55 @@ export default function Home() {
       </section>
 
       {draggingFile && <div className="drop-overlay"><strong>Drop the document</strong><span>PDF or DOCX · closed-document analysis</span></div>}
+      {quiz && (
+        <div className="quiz-overlay" role="dialog" aria-modal="true" aria-label="Reading checkpoint">
+          <article className="quiz-card">
+            <header>
+              <div>
+                <span>Reading checkpoint</span>
+                <strong>{graph.nodes.find((node) => node.id === quiz.nodeId)?.label}</strong>
+              </div>
+              <div className="attempt-meter" aria-label={`Attempt ${quiz.attempt} of 3`}>
+                {[1, 2, 3].map((attempt) => <i className={attempt <= quiz.attempt ? "active" : ""} key={attempt} />)}
+              </div>
+            </header>
+            <div className="quiz-signal">
+              <span>Adaptive skill</span>
+              <b>{quiz.question.errorType.replace("-", " ")}</b>
+            </div>
+            <h2>{quiz.question.prompt}</h2>
+            <div className="quiz-choices">
+              {quiz.question.choices.map((choice, index) => {
+                const correctChoice = selectedAnswer !== null && index === quiz.question.correctIndex;
+                const wrongChoice = selectedAnswer === index && index !== quiz.question.correctIndex;
+                return (
+                  <button
+                    className={correctChoice ? "correct" : wrongChoice ? "wrong" : ""}
+                    disabled={selectedAnswer !== null}
+                    key={`${choice}-${index}`}
+                    onClick={() => answerQuestion(index)}
+                  >
+                    <span>{String.fromCharCode(65 + index)}</span>
+                    <b>{choice}</b>
+                  </button>
+                );
+              })}
+            </div>
+            {quizOutcome && (
+              <div className={`quiz-feedback ${quizOutcome}`}>
+                <span>{quizOutcome === "mastered" ? "Node unlocked" : quizOutcome === "fragile" ? "Unlocked for review" : "Retrieval correction"}</span>
+                <p>{quiz.question.explanation}</p>
+                {quizOutcome === "retry" ? (
+                  <button onClick={retryCheckpoint}>Try a different question · {quiz.attempt + 1}/3</button>
+                ) : (
+                  <button onClick={closeCheckpoint}>{quizOutcome === "mastered" ? "Grow the network" : "Continue with a grey node"}</button>
+                )}
+              </div>
+            )}
+            {!quizOutcome && <footer>Choose one answer. The next node stays hidden until this checkpoint is resolved.</footer>}
+          </article>
+        </div>
+      )}
       {readerOpen && documentPreview && (
         <div className="reader-overlay" role="dialog" aria-label={`Reading ${documentPreview.name}`} onClick={() => setReaderOpen(false)}>
           <aside className="document-reader" onClick={(event) => event.stopPropagation()}>
