@@ -34,7 +34,7 @@ test("server-renders the graph and reading workspace", async () => {
   assert.match(html, /Start with one node/);
 });
 
-test("keeps the canvas visible, reader scrollable, and inspector hidden", async () => {
+test("keeps the canvas visible and the reading canvas non-interruptive", async () => {
   const [css, page] = await Promise.all([
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -45,6 +45,12 @@ test("keeps the canvas visible, reader scrollable, and inspector hidden", async 
   assert.match(css, /\.reading-pane\s*\{[^}]*overflow:\s*hidden/s);
   assert.match(css, /\.reading-scroll\s*\{[^}]*overflow-y:\s*scroll/s);
   assert.match(css, /\.inspector\s*\{[^}]*display:\s*none/s);
+  assert.match(css, /\.reading-paragraph\.active\s*>\s*p\s*\{[^}]*color:\s*var\(--ink\)/s);
+  assert.match(css, /\.reading-paragraph\.read\s*>\s*p\s*\{[^}]*color:\s*color-mix/s);
+  assert.match(css, /\.checkpoint-notice\s*\{[^}]*position:\s*absolute/s);
   assert.match(page, /node\.kind === "topic" \? 18/);
   assert.match(page, /\[1\.7,\s*2\.4\]/);
+  assert.match(page, /setCheckpointNoticeId\(nextLocked\.id\)/);
+  assert.match(page, /aria-label="Close checkpoint"/);
+  assert.doesNotMatch(page, /markerTop[^;]+beginCheckpoint\(nextLocked\)/s);
 });

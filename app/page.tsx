@@ -151,6 +151,7 @@ export default function Home() {
   const previewUrlRef = useRef<string | null>(null);
   const readerScrollRef = useRef<HTMLDivElement>(null);
   const questionStartedAt = useRef(0);
+  const dismissedCheckpointNotices = useRef(new Set<string>());
   const rotation = useRef({ x: -.12, y: -.08 });
   const zoom = useRef(1);
   const drag = useRef({ active: false, x: 0, y: 0 });
@@ -177,6 +178,8 @@ export default function Home() {
   const [quizLoading, setQuizLoading] = useState("");
   const [selectedAnswer, setSelectedAnswer] = useState<number | null>(null);
   const [quizOutcome, setQuizOutcome] = useState<QuizOutcome>(null);
+  const [activeReaderParagraph, setActiveReaderParagraph] = useState(-1);
+  const [checkpointNoticeId, setCheckpointNoticeId] = useState<string | null>(null);
   const learningNodes = useMemo(() => {
     const ordered: KnowledgeNode[] = [];
     const seen = new Set<string>();
@@ -504,6 +507,9 @@ export default function Home() {
       setQuiz(null);
       setSelectedAnswer(null);
       setQuizOutcome(null);
+      setActiveReaderParagraph(-1);
+      setCheckpointNoticeId(null);
+      dismissedCheckpointNotices.current.clear();
       setFileName(file.name);
       rotation.current = { x: -.12, y: -.08 };
       zoom.current = nextGraph.nodes.length > 35 ? .8 : 1;
@@ -624,21 +630,41 @@ export default function Home() {
   const beginCheckpoint = (node: KnowledgeNode) => {
     const nextLocked = learningNodes.find((candidate) => !nodeProgress[candidate.id]);
     if (!progressionEnabled || quiz || quizLoading || !nextLocked || nextLocked.id !== node.id) return;
+    dismissedCheckpointNotices.current.add(node.id);
+    setCheckpointNoticeId(null);
     void requestAdaptiveQuestion(node, 1);
   };
 
   const onReaderScroll = () => {
     const container = readerScrollRef.current;
     const nextLocked = learningNodes.find((node) => !nodeProgress[node.id]);
-    if (!container || !nextLocked || quiz || quizLoading) return;
+    if (!container) return;
+
+    const readingLine = container.getBoundingClientRect().top + container.clientHeight * .42;
+    let activeIndex = -1;
+    container.querySelectorAll<HTMLElement>("[data-reader-index]").forEach((paragraph) => {
+      if (paragraph.getBoundingClientRect().top <= readingLine) {
+        activeIndex = Number(paragraph.dataset.readerIndex);
+      }
+    });
+    setActiveReaderParagraph(activeIndex);
+
+    if (!nextLocked || dismissedCheckpointNotices.current.has(nextLocked.id)) return;
     const marker = container.querySelector<HTMLElement>(
       `[data-checkpoint-id="${CSS.escape(nextLocked.id)}"]`,
     );
     if (!marker) return;
     const containerTop = container.getBoundingClientRect().top;
     const markerTop = marker.getBoundingClientRect().top;
-    if (markerTop <= containerTop + container.clientHeight * .72) beginCheckpoint(nextLocked);
+    if (markerTop <= containerTop + container.clientHeight * .82) {
+      setCheckpointNoticeId(nextLocked.id);
+    }
   };
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(onReaderScroll);
+    return () => window.cancelAnimationFrame(frame);
+  }, [readerParagraphs.length]);
 
   const answerQuestion = (answerIndex: number) => {
     if (!quiz || selectedAnswer !== null) return;
@@ -673,10 +699,29 @@ export default function Home() {
   };
 
   const closeCheckpoint = () => {
+    if (quiz) dismissedCheckpointNotices.current.add(quiz.nodeId);
     setQuiz(null);
     setSelectedAnswer(null);
     setQuizOutcome(null);
   };
+
+  const dismissCheckpointNotice = () => {
+    if (checkpointNoticeId) dismissedCheckpointNotices.current.add(checkpointNoticeId);
+    setCheckpointNoticeId(null);
+  };
+
+  useEffect(() => {
+    if (!quiz) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeCheckpoint();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [quiz]);
+
+  const checkpointNoticeNode = checkpointNoticeId
+    ? learningNodes.find((node) => node.id === checkpointNoticeId) ?? null
+    : null;
 
   return (
     <main
@@ -838,13 +883,26 @@ export default function Home() {
                 <div className="reading-cover">
                   <span>Closed-document quest</span>
                   <h2>{graph.title}</h2>
-                  <p>Read naturally. A checkpoint appears as you reach each marked passage; pass it to grow the network.</p>
+                  <p>Read without interruption. At the end of a topic, a checkpoint becomes available for you to open when ready.</p>
                 </div>
-                {readerParagraphs.map((paragraph, index) => (
-                  <section className={/^\[PAGE \d+\]$/.test(paragraph) ? "page-marker" : "reading-paragraph"} key={`${index}-${paragraph.slice(0, 18)}`}>
+                {readerParagraphs.map((paragraph, index) => {
+                  const pageMarker = /^\[PAGE \d+\]$/.test(paragraph);
+                  const readingState = index < activeReaderParagraph
+                    ? "read"
+                    : index === activeReaderParagraph
+                      ? "active"
+                      : "unread";
+                  return (
+                  <section
+                    className={pageMarker ? "page-marker" : `reading-paragraph ${readingState}`}
+                    data-reader-index={pageMarker ? undefined : index}
+                    key={`${index}-${paragraph.slice(0, 18)}`}
+                  >
+                    {pageMarker ? <span>{paragraph.replace(/\[|\]/g, "")}</span> : <p>{paragraph}</p>}
                     {(checkpointsByParagraph.get(index) ?? []).map((node) => {
                       const status = nodeProgress[node.id];
                       const nextLocked = learningNodes.find((candidate) => !nodeProgress[candidate.id]);
+                      if (!status && nextLocked?.id !== node.id) return null;
                       return (
                         <button
                           className={`reader-checkpoint ${status || "locked"}`}
@@ -853,14 +911,15 @@ export default function Home() {
                           onClick={() => status ? jumpToNode(node.id) : nextLocked?.id === node.id ? beginCheckpoint(node) : undefined}
                         >
                           <i />
-                          <span>{status === "mastered" ? "Unlocked" : status === "fragile" ? "Needs practice" : "Checkpoint"}</span>
+                          <span>{status === "mastered" ? "Unlocked" : status === "fragile" ? "Needs practice" : "Topic complete"}</span>
                           <b>{node.label}</b>
+                          {!status && <em>Open checkpoint →</em>}
                         </button>
                       );
                     })}
-                    {/^\[PAGE \d+\]$/.test(paragraph) ? <span>{paragraph.replace(/\[|\]/g, "")}</span> : <p>{paragraph}</p>}
                   </section>
-                ))}
+                  );
+                })}
               </article>
             ) : (
               <div className="reading-empty">
@@ -877,6 +936,15 @@ export default function Home() {
               <b>{weakestErrorTypes(weaknessProfile)[0].replace("-", " ")}</b>
               <em>Private on this device</em>
             </footer>
+          )}
+          {checkpointNoticeNode && (
+            <aside className="checkpoint-notice" role="status" aria-label={`Checkpoint ready for ${checkpointNoticeNode.label}`}>
+              <button className="checkpoint-notice-close" onClick={dismissCheckpointNotice} aria-label="Dismiss checkpoint notice">×</button>
+              <span>Topic complete</span>
+              <b>{checkpointNoticeNode.label}</b>
+              <p>Your checkpoint is ready. Open it whenever you want—reading will never be interrupted.</p>
+              <button className="checkpoint-notice-open" onClick={() => beginCheckpoint(checkpointNoticeNode)}>Open checkpoint</button>
+            </aside>
           )}
         </section>
 
@@ -926,15 +994,18 @@ export default function Home() {
 
       {draggingFile && <div className="drop-overlay"><strong>Drop the document</strong><span>PDF or DOCX · closed-document analysis</span></div>}
       {quiz && (
-        <div className="quiz-overlay" role="dialog" aria-modal="true" aria-label="Reading checkpoint">
-          <article className="quiz-card">
+        <div className="quiz-overlay" role="dialog" aria-modal="true" aria-label="Reading checkpoint" onClick={closeCheckpoint}>
+          <article className="quiz-card" onClick={(event) => event.stopPropagation()}>
             <header>
               <div>
                 <span>Reading checkpoint</span>
                 <strong>{graph.nodes.find((node) => node.id === quiz.nodeId)?.label}</strong>
               </div>
-              <div className="attempt-meter" aria-label={`Attempt ${quiz.attempt} of 3`}>
-                {[1, 2, 3].map((attempt) => <i className={attempt <= quiz.attempt ? "active" : ""} key={attempt} />)}
+              <div className="quiz-head-actions">
+                <div className="attempt-meter" aria-label={`Attempt ${quiz.attempt} of 3`}>
+                  {[1, 2, 3].map((attempt) => <i className={attempt <= quiz.attempt ? "active" : ""} key={attempt} />)}
+                </div>
+                <button className="quiz-close" onClick={closeCheckpoint} aria-label="Close checkpoint">×</button>
               </div>
             </header>
             <div className="quiz-signal">
