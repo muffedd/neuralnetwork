@@ -9,14 +9,17 @@ import {
   type KnowledgeGraph,
   type KnowledgeNode,
 } from "./document-graph";
+import { findEvidenceParagraph, splitDocumentText } from "./reading-flow";
 import {
   fallbackQuestion,
+  nextCheckpointAttempt,
   updateWeaknessProfile,
   weakestErrorTypes,
   type AdaptiveQuestion,
   type NodeProgress,
   type WeaknessProfile,
 } from "./learning-engine";
+import { loadStudySession, saveStudySession } from "./study-session";
 
 const DEMO_NODES: KnowledgeNode[] = [
   { id: "topic", label: "Photosynthesis", kind: "topic", x: 0, y: 0, z: 0, note: "Central topic identified from the document." },
@@ -67,59 +70,6 @@ type QuizSession = {
 };
 type QuizOutcome = "retry" | "mastered" | "fragile" | null;
 
-function splitDocumentText(text: string): string[] {
-  const normalized = text.replace(/\r/g, "").replace(/\u0000/g, " ").trim();
-  if (!normalized) return [];
-  const blocks = normalized
-    .replace(/(\[PAGE \d+\])/g, "\n\n$1\n\n")
-    .split(/\n{2,}/)
-    .map((block) => block.replace(/\n+/g, " ").replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  const paragraphs: string[] = [];
-  blocks.forEach((block) => {
-    if (block.length <= 680 || /^\[PAGE \d+\]$/.test(block)) {
-      paragraphs.push(block);
-      return;
-    }
-    const sentences = block.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [block];
-    let paragraph = "";
-    sentences.forEach((sentence) => {
-      if (paragraph && paragraph.length + sentence.length > 540) {
-        paragraphs.push(paragraph.trim());
-        paragraph = "";
-      }
-      paragraph += `${sentence.trim()} `;
-    });
-    if (paragraph.trim()) paragraphs.push(paragraph.trim());
-  });
-  return paragraphs;
-}
-
-const READER_STOP_WORDS = new Set(
-  "about after also and are because been before being between both but can could does for from has have into its more most not only other over same should such than that the their them then there these they this those through under very was were what when where which while will with would".split(" "),
-);
-
-function findEvidenceParagraph(node: KnowledgeNode, paragraphs: string[], fallback: number) {
-  const source = `${node.label} ${node.evidence || ""} ${node.memoryNote || ""} ${node.note || ""}`
-    .toLowerCase()
-    .replace(/[^a-z0-9 ]/g, " ");
-  const tokens = [...new Set(source.split(/\s+/).filter((token) => token.length > 3 && !READER_STOP_WORDS.has(token)))];
-  if (!tokens.length) return fallback;
-  let bestIndex = fallback;
-  let bestScore = 0;
-  paragraphs.forEach((paragraph, index) => {
-    if (/^\[PAGE \d+\]$/.test(paragraph)) return;
-    const candidate = paragraph.toLowerCase();
-    const matches = tokens.filter((token) => candidate.includes(token)).length;
-    const score = matches / tokens.length;
-    if (score > bestScore) {
-      bestScore = score;
-      bestIndex = index;
-    }
-  });
-  return bestScore >= .12 ? bestIndex : fallback;
-}
-
 function makeField(nodes: KnowledgeNode[]): FieldPoint[] {
   let seed = nodes.reduce((sum, node) => sum + node.label.charCodeAt(0), 7419);
   const random = () => {
@@ -150,6 +100,11 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const previewUrlRef = useRef<string | null>(null);
   const readerScrollRef = useRef<HTMLDivElement>(null);
+  const readerScrollFrame = useRef<number | null>(null);
+  const quizCardRef = useRef<HTMLElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const studySessionHydrated = useRef(false);
+  const fileAnalysisStarted = useRef(false);
   const questionStartedAt = useRef(0);
   const dismissedCheckpointNotices = useRef(new Set<string>());
   const rotation = useRef({ x: -.12, y: -.08 });
@@ -173,6 +128,7 @@ export default function Home() {
   const [flashcardId, setFlashcardId] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [nodeProgress, setNodeProgress] = useState<Record<string, NodeProgress>>({});
+  const [checkpointAttempts, setCheckpointAttempts] = useState<Record<string, number>>({});
   const [weaknessProfile, setWeaknessProfile] = useState<WeaknessProfile>({});
   const [quiz, setQuiz] = useState<QuizSession | null>(null);
   const [quizLoading, setQuizLoading] = useState("");
@@ -226,14 +182,6 @@ export default function Home() {
     [focusId, graph.nodes],
   );
   const fieldPoints = useMemo(() => makeField(visibleNodes), [visibleNodes]);
-  const selectedNode = useMemo(
-    () => visibleNodes.find((node) => node.id === selected) ?? visibleNodes[0] ?? graph.nodes[0],
-    [selected, visibleNodes],
-  );
-  const canFocusSelected = useMemo(
-    () => Boolean(selectedNode) && visibleEdges.some((edge) => edge.from === selectedNode.id || edge.to === selectedNode.id),
-    [selectedNode, visibleEdges],
-  );
   const studyNodes = useMemo(
     () => availableNodes.filter((node) => node.kind === "concept" || node.kind === "bridge"),
     [availableNodes],
@@ -246,18 +194,47 @@ export default function Home() {
   const checkpointsByParagraph = useMemo(() => {
     const checkpoints = new Map<number, KnowledgeNode[]>();
     if (!readerParagraphs.length || !learningNodes.length) return checkpoints;
+    const readableIndexes = readerParagraphs
+      .map((paragraph, index) => (/^\[PAGE \d+\]$/.test(paragraph) ? -1 : index))
+      .filter((index) => index >= 0);
+    const lastReadableIndex = readableIndexes.at(-1) ?? readerParagraphs.length - 1;
+    const branches = learningNodes.filter((node) => node.kind === "branch");
+    const branchStarts = new Map<string, number>();
+    let previousStart = readableIndexes[0] ?? 0;
+    branches.forEach((branch, index) => {
+      const fallback = readableIndexes[Math.min(
+        readableIndexes.length - 1,
+        Math.floor((index / Math.max(1, branches.length)) * readableIndexes.length),
+      )] ?? previousStart;
+      const start = Math.max(previousStart, findEvidenceParagraph(branch, readerParagraphs, fallback));
+      branchStarts.set(branch.id, start);
+      previousStart = start;
+    });
+    const branchEnds = new Map<string, number>();
+    branches.forEach((branch, index) => {
+      const nextStart = index + 1 < branches.length ? branchStarts.get(branches[index + 1].id) : undefined;
+      const endCandidate = nextStart === undefined ? lastReadableIndex : Math.max(branchStarts.get(branch.id) ?? 0, nextStart - 1);
+      const readableEnd = [...readableIndexes].reverse().find((position) => position <= endCandidate) ?? endCandidate;
+      branchEnds.set(branch.id, readableEnd);
+    });
     let lastPosition = 0;
     learningNodes.forEach((node, index) => {
       const fallback = Math.min(
         readerParagraphs.length - 1,
         Math.max(0, Math.floor(((index + 1) / (learningNodes.length + 1)) * readerParagraphs.length)),
       );
-      const position = Math.max(lastPosition, findEvidenceParagraph(node, readerParagraphs, fallback));
+      const parentBranchId = node.kind === "branch"
+        ? node.id
+        : graph.edges.find((edge) => edge.to === node.id && branches.some((branch) => branch.id === edge.from))?.from;
+      const topicEnd = parentBranchId ? branchEnds.get(parentBranchId) : undefined;
+      const evidencePosition = findEvidenceParagraph(node, readerParagraphs, fallback);
+      const intendedPosition = topicEnd ?? evidencePosition;
+      const position = Math.max(lastPosition, intendedPosition);
       lastPosition = position;
       checkpoints.set(position, [...(checkpoints.get(position) ?? []), node]);
     });
     return checkpoints;
-  }, [learningNodes, readerParagraphs.length]);
+  }, [graph.edges, learningNodes, readerParagraphs]);
   const completedCount = useMemo(
     () => learningNodes.filter((node) => Boolean(nodeProgress[node.id])).length,
     [learningNodes, nodeProgress],
@@ -277,6 +254,38 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    void loadStudySession()
+      .then((session) => {
+        if (
+          cancelled
+          || fileAnalysisStarted.current
+          || !session
+          || session.version !== 1
+          || !session.documentText
+          || !session.graph?.nodes?.length
+        ) return;
+        setGraph(session.graph);
+        setDocumentText(session.documentText);
+        setFileName(session.fileName);
+        setNodeProgress(session.nodeProgress ?? { topic: "mastered" });
+        setCheckpointAttempts(session.checkpointAttempts ?? {});
+        setAnalysisMode("gemini");
+        setMode("all");
+        setSelected("topic");
+      })
+      .catch(() => {
+        // IndexedDB can be unavailable in private browsing; the live session still works.
+      })
+      .finally(() => {
+        studySessionHydrated.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!Object.keys(weaknessProfile).length) return;
     try {
       window.localStorage.setItem("knowledge-galaxy-weakness-v1", JSON.stringify(weaknessProfile));
@@ -284,6 +293,21 @@ export default function Home() {
       // Storage can be disabled; keep the in-memory learner model active.
     }
   }, [weaknessProfile]);
+
+  useEffect(() => {
+    if (!studySessionHydrated.current || !progressionEnabled || !fileName) return;
+    void saveStudySession({
+      version: 1,
+      fileName,
+      documentText,
+      graph,
+      nodeProgress,
+      checkpointAttempts,
+      savedAt: Date.now(),
+    }).catch(() => {
+      // Persistence is an enhancement; never interrupt the learner if storage is unavailable.
+    });
+  }, [checkpointAttempts, documentText, fileName, graph, nodeProgress, progressionEnabled]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -453,37 +477,33 @@ export default function Home() {
       setError("Choose a PDF or DOCX file.");
       return;
     }
+    fileAnalysisStarted.current = true;
+    studySessionHydrated.current = true;
     setError("");
     setLastFile(file);
-    setDocumentText("");
-    setNodeProgress({});
     setProcessing("Reading document…");
+    let pendingPdfUrl: string | null = null;
     try {
-      if (previewUrlRef.current) {
-        URL.revokeObjectURL(previewUrlRef.current);
-        previewUrlRef.current = null;
-      }
+      let nextDocumentPreview: DocumentPreview;
       if (file.name.toLowerCase().endsWith(".pdf")) {
-        const url = URL.createObjectURL(file);
-        previewUrlRef.current = url;
-        setDocumentPreview({ type: "pdf", url, name: file.name });
+        pendingPdfUrl = URL.createObjectURL(file);
+        nextDocumentPreview = { type: "pdf", url: pendingPdfUrl, name: file.name };
       } else {
         const [mammoth, purifierModule] = await Promise.all([
           import("mammoth/mammoth.browser"),
           import("dompurify"),
         ]);
         const converted = await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() });
-        setDocumentPreview({
+        nextDocumentPreview = {
           type: "docx",
           html: purifierModule.default.sanitize(converted.value, {
             USE_PROFILES: { html: true },
             FORBID_TAGS: ["script", "style", "iframe", "object", "embed"],
           }),
           name: file.name,
-        });
+        };
       }
       const text = await extractDocumentText(file);
-      setDocumentText(text);
       if (text.trim().length < 80) throw new Error("This document contains too little selectable text. Scanned PDFs need OCR first.");
       setProcessing("Gemini is mapping topics…");
       const response = await fetch("/api/analyze", {
@@ -497,6 +517,11 @@ export default function Home() {
       if (nextGraph.nodes.length < 5 || nextGraph.sectionCount < 1) {
         throw new Error("The extracted graph did not pass the quality check. Try a cleaner copy of the chapter.");
       }
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = pendingPdfUrl;
+      pendingPdfUrl = null;
+      setDocumentPreview(nextDocumentPreview);
+      setDocumentText(text);
       setGraph(nextGraph);
       setAnalysisMode("gemini");
       setMode("all");
@@ -504,6 +529,7 @@ export default function Home() {
       setFocusId(null);
       setFlashcardId(null);
       setNodeProgress({ topic: "mastered" });
+      setCheckpointAttempts({});
       setQuiz(null);
       setSelectedAnswer(null);
       setQuizOutcome(null);
@@ -513,8 +539,10 @@ export default function Home() {
       setFileName(file.name);
       rotation.current = { x: -.12, y: -.08 };
       zoom.current = nextGraph.nodes.length > 35 ? .8 : 1;
+      window.requestAnimationFrame(() => readerScrollRef.current?.scrollTo({ top: 0 }));
       setProcessing("");
     } catch (reason) {
+      if (pendingPdfUrl) URL.revokeObjectURL(pendingPdfUrl);
       setProcessing("");
       setError(reason instanceof Error ? reason.message : "The document could not be read.");
     }
@@ -538,12 +566,13 @@ export default function Home() {
     draw();
   };
 
-  const focusSelected = () => {
-    if (!canFocusSelected) return;
-    setFocusId(selectedNode.id);
-    setSelected(selectedNode.id);
+  const focusGraphNode = (node: KnowledgeNode) => {
+    const hasConnections = visibleEdges.some((edge) => edge.from === node.id || edge.to === node.id);
+    if (!hasConnections) return;
+    setFocusId(node.id);
+    setSelected(node.id);
     rotation.current = { x: -.08, y: -.05 };
-    const children = graph.edges.filter((edge) => edge.from === selectedNode.id).length;
+    const children = graph.edges.filter((edge) => edge.from === node.id).length;
     zoom.current = children > 7 ? 1.02 : 1.28;
   };
 
@@ -576,6 +605,16 @@ export default function Home() {
       `[data-checkpoint-id="${CSS.escape(nodeId)}"]`,
     );
     marker?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const activateGraphNode = (node: KnowledgeNode) => {
+    if (focusId === node.id) {
+      exitFocus();
+    } else {
+      focusGraphNode(node);
+    }
+    jumpToNode(node.id);
+    if (node.kind === "concept" || node.kind === "bridge") openFlashcard(node);
   };
 
   const requestAdaptiveQuestion = async (
@@ -632,27 +671,21 @@ export default function Home() {
     if (!progressionEnabled || quiz || quizLoading || !nextLocked || nextLocked.id !== node.id) return;
     dismissedCheckpointNotices.current.add(node.id);
     setCheckpointNoticeId(null);
-    void requestAdaptiveQuestion(node, 1);
+    const nextAttempt = nextCheckpointAttempt(checkpointAttempts[node.id]);
+    void requestAdaptiveQuestion(node, nextAttempt);
   };
 
-  const onReaderScroll = () => {
+  const updateReaderScrollState = () => {
     const container = readerScrollRef.current;
     const nextLocked = learningNodes.find((node) => !nodeProgress[node.id]);
     if (!container) return;
 
-    const readingLine = container.getBoundingClientRect().top + container.clientHeight * .42;
-    let activeIndex = -1;
-    const paragraphs = [...container.querySelectorAll<HTMLElement>("[data-reader-index]")];
-    paragraphs.forEach((paragraph) => {
-      if (paragraph.getBoundingClientRect().top <= readingLine) {
-        activeIndex = Number(paragraph.dataset.readerIndex);
-      }
-    });
     const atDocumentEnd = container.scrollTop + container.clientHeight >= container.scrollHeight - 3;
-    if (atDocumentEnd && paragraphs.length) {
-      activeIndex = Number(paragraphs.at(-1)?.dataset.readerIndex);
+    if (atDocumentEnd) {
+      const lastParagraph = container.querySelector<HTMLElement>("[data-reader-index]:last-of-type")
+        ?? [...container.querySelectorAll<HTMLElement>("[data-reader-index]")].at(-1);
+      if (lastParagraph) setActiveReaderParagraph(Number(lastParagraph.dataset.readerIndex));
     }
-    setActiveReaderParagraph(activeIndex);
 
     if (!nextLocked || dismissedCheckpointNotices.current.has(nextLocked.id)) return;
     const marker = container.querySelector<HTMLElement>(
@@ -666,10 +699,45 @@ export default function Home() {
     }
   };
 
+  const onReaderScroll = () => {
+    if (readerScrollFrame.current !== null) return;
+    readerScrollFrame.current = window.requestAnimationFrame(() => {
+      readerScrollFrame.current = null;
+      updateReaderScrollState();
+    });
+  };
+
   useEffect(() => {
-    const frame = window.requestAnimationFrame(onReaderScroll);
-    return () => window.cancelAnimationFrame(frame);
-  }, [readerParagraphs.length]);
+    const container = readerScrollRef.current;
+    if (!container) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const active = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)
+          .at(-1);
+        const element = active?.target as HTMLElement | undefined;
+        if (element?.dataset.readerIndex) {
+          setActiveReaderParagraph(Number(element.dataset.readerIndex));
+        }
+      },
+      {
+        root: container,
+        rootMargin: "-38% 0px -56% 0px",
+        threshold: 0,
+      },
+    );
+    container.querySelectorAll<HTMLElement>("[data-reader-index]").forEach((paragraph) => observer.observe(paragraph));
+    const frame = window.requestAnimationFrame(updateReaderScrollState);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [completedCount, readerParagraphs.length]);
+
+  useEffect(() => () => {
+    if (readerScrollFrame.current !== null) window.cancelAnimationFrame(readerScrollFrame.current);
+  }, []);
 
   const answerQuestion = (answerIndex: number) => {
     if (!quiz || selectedAnswer !== null) return;
@@ -685,13 +753,20 @@ export default function Home() {
     setSelectedAnswer(answerIndex);
     if (correct) {
       setNodeProgress((current) => ({ ...current, [quiz.nodeId]: "mastered" }));
+      setCheckpointAttempts((current) => {
+        const next = { ...current };
+        delete next[quiz.nodeId];
+        return next;
+      });
       setSelected(quiz.nodeId);
       setQuizOutcome("mastered");
     } else if (quiz.attempt >= 3) {
+      setCheckpointAttempts((current) => ({ ...current, [quiz.nodeId]: quiz.attempt }));
       setNodeProgress((current) => ({ ...current, [quiz.nodeId]: "fragile" }));
       setSelected(quiz.nodeId);
       setQuizOutcome("fragile");
     } else {
+      setCheckpointAttempts((current) => ({ ...current, [quiz.nodeId]: quiz.attempt }));
       setQuizOutcome("retry");
     }
   };
@@ -717,11 +792,38 @@ export default function Home() {
 
   useEffect(() => {
     if (!quiz) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeCheckpoint();
+    restoreFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => {
+      quizCardRef.current
+        ?.querySelector<HTMLElement>("button:not([disabled]), [href], [tabindex]:not([tabindex='-1'])")
+        ?.focus();
+    });
+    const manageDialogKeyboard = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeCheckpoint();
+        return;
+      }
+      if (event.key !== "Tab" || !quizCardRef.current) return;
+      const focusable = [...quizCardRef.current.querySelectorAll<HTMLElement>(
+        "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+      )];
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    window.addEventListener("keydown", manageDialogKeyboard);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", manageDialogKeyboard);
+      restoreFocusRef.current?.focus();
+    };
   }, [quiz]);
 
   const checkpointNoticeNode = checkpointNoticeId
@@ -808,7 +910,7 @@ export default function Home() {
                 const clicked = closest as { id: string; distance: number } | null;
                 if (clicked) {
                   const node = visibleNodes.find((candidate) => candidate.id === clicked.id);
-                  if (node) jumpToNode(node.id);
+                  if (node) activateGraphNode(node);
                 }
               }
             }}
@@ -829,7 +931,7 @@ export default function Home() {
               draw();
             }}
           />
-          <div className="orbit-hint">DRAG TO ORBIT <span>·</span> SCROLL TO ZOOM <span>·</span> CLICK NODE TO JUMP IN THE READER</div>
+          <div className="orbit-hint">DRAG TO ORBIT <span>·</span> SCROLL TO ZOOM <span>·</span> CLICK NODE TO FOCUS + JUMP</div>
           <div className="mode-switch" aria-label="Graph view">
             {focusId && <button className="back-map" onClick={exitFocus}>← Full map</button>}
             {(["all", "hierarchy", "bridges"] as const).map((item) => (
@@ -916,7 +1018,7 @@ export default function Home() {
                           onClick={() => status ? jumpToNode(node.id) : nextLocked?.id === node.id ? beginCheckpoint(node) : undefined}
                         >
                           <i />
-                          <span>{status === "mastered" ? "Unlocked" : status === "fragile" ? "Needs practice" : "Topic complete"}</span>
+                          <span>{status === "mastered" ? "Unlocked" : status === "fragile" ? "Needs practice" : node.kind === "branch" ? "Topic checkpoint" : "Concept checkpoint"}</span>
                           <b>{node.label}</b>
                           {!status && <em>Open checkpoint →</em>}
                         </button>
@@ -935,6 +1037,15 @@ export default function Home() {
               </div>
             )}
           </div>
+          {checkpointNoticeNode && (
+            <aside className="checkpoint-notice" role="status" aria-label={`Checkpoint ready for ${checkpointNoticeNode.label}`}>
+              <button className="checkpoint-notice-close" onClick={dismissCheckpointNotice} aria-label="Dismiss checkpoint notice">×</button>
+              <span>Checkpoint ready</span>
+              <b>{checkpointNoticeNode.label}</b>
+              <p>Open it whenever you are ready. Your notes remain visible.</p>
+              <button className="checkpoint-notice-open" onClick={() => beginCheckpoint(checkpointNoticeNode)}>Open checkpoint</button>
+            </aside>
+          )}
           {progressionEnabled && (
             <footer className="adaptive-status">
               <span>Adaptive focus</span>
@@ -942,65 +1053,14 @@ export default function Home() {
               <em>Private on this device</em>
             </footer>
           )}
-          {checkpointNoticeNode && (
-            <aside className="checkpoint-notice" role="status" aria-label={`Checkpoint ready for ${checkpointNoticeNode.label}`}>
-              <button className="checkpoint-notice-close" onClick={dismissCheckpointNotice} aria-label="Dismiss checkpoint notice">×</button>
-              <span>Topic complete</span>
-              <b>{checkpointNoticeNode.label}</b>
-              <p>Your checkpoint is ready. Open it whenever you want—reading will never be interrupted.</p>
-              <button className="checkpoint-notice-open" onClick={() => beginCheckpoint(checkpointNoticeNode)}>Open checkpoint</button>
-            </aside>
-          )}
         </section>
 
-        <aside className="inspector">
-          {focusNode && (
-            <div className="focus-banner">
-              <span>Focused view</span>
-              <b>{focusNode.label}</b>
-              <button onClick={exitFocus}>Show full network</button>
-            </div>
-          )}
-          <div className="inspector-head">
-            <span className={`node-icon ${selectedNode.kind}`} />
-            <span>{selectedNode.kind === "topic" ? "Main topic" : selectedNode.kind === "branch" ? "Subtopic" : selectedNode.kind === "bridge" ? "Shared concept" : "Supporting concept"}</span>
-          </div>
-          <h2>{selectedNode.label}</h2>
-          {progressionEnabled && selectedNode.id !== "topic" && (
-            <div className={`mastery-pill ${nodeProgress[selectedNode.id] || "locked"}`}>
-              {nodeProgress[selectedNode.id] === "mastered" ? "Mastered" : nodeProgress[selectedNode.id] === "fragile" ? "Needs practice" : "Locked"}
-            </div>
-          )}
-          <p>{selectedNode.note}</p>
-          {canFocusSelected && focusId !== selectedNode.id && (
-            <button className="focus-action" onClick={focusSelected}>
-              <span>◎</span>
-              <b>Focus this topic</b>
-              <small>Show only this node and its closest connected concepts</small>
-            </button>
-          )}
-          {selectedNode.kind === "bridge" && (
-            <div className="bridge-callout"><span className="spark">✦</span><div><strong>Memory bridge</strong><small>One node shared across document sections</small></div></div>
-          )}
-          <div className="relations">
-            <span>Connected relationships</span>
-            {visibleEdges.filter((edge) => edge.from === selectedNode.id || edge.to === selectedNode.id).map((edge, index) => {
-              const other = visibleNodes.find((node) => node.id === (edge.from === selectedNode.id ? edge.to : edge.from));
-              return (
-                <button key={`${edge.from}-${edge.to}-${index}`} onClick={() => other && jumpToNode(other.id)}>
-                  <i /><b>{other?.label}</b><em>{edge.relation}</em>
-                </button>
-              );
-            })}
-          </div>
-          <div className="legend"><span><i /> hierarchy</span><span><i className="dashed" /> knowledge connection</span></div>
-        </aside>
       </section>
 
       {draggingFile && <div className="drop-overlay"><strong>Drop the document</strong><span>PDF or DOCX · closed-document analysis</span></div>}
       {quiz && (
-        <div className="quiz-overlay" role="dialog" aria-modal="true" aria-label="Reading checkpoint" onClick={closeCheckpoint}>
-          <article className="quiz-card" onClick={(event) => event.stopPropagation()}>
+        <div className="quiz-overlay" role="dialog" aria-modal="true" aria-labelledby="checkpoint-question" onClick={closeCheckpoint}>
+          <article className="quiz-card" ref={quizCardRef} tabIndex={-1} onClick={(event) => event.stopPropagation()}>
             <header>
               <div>
                 <span>Reading checkpoint</span>
@@ -1017,7 +1077,7 @@ export default function Home() {
               <span>Adaptive skill</span>
               <b>{quiz.question.errorType.replace("-", " ")}</b>
             </div>
-            <h2>{quiz.question.prompt}</h2>
+            <h2 id="checkpoint-question">{quiz.question.prompt}</h2>
             <div className="quiz-choices">
               {quiz.question.choices.map((choice, index) => {
                 const correctChoice = selectedAnswer !== null && index === quiz.question.correctIndex;

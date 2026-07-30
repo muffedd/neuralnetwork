@@ -81,6 +81,10 @@ export function weakestErrorTypes(profile: WeaknessProfile): ErrorType[] {
   });
 }
 
+export function nextCheckpointAttempt(failedAttempts = 0) {
+  return Math.min(3, Math.max(0, Math.floor(failedAttempts)) + 1);
+}
+
 export function fallbackQuestion(
   node: KnowledgeNode,
   distractorNodes: KnowledgeNode[],

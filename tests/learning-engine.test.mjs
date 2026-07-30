@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   fallbackQuestion,
+  nextCheckpointAttempt,
   updateWeaknessProfile,
   weakestErrorTypes,
 } from "../app/learning-engine.ts";
@@ -16,6 +17,13 @@ test("updates an interpretable weakness profile from learner responses", () => {
   assert.equal(afterSuccess.definition.correct, 1);
   assert.ok(afterSuccess.relationship.mastery < afterSuccess.definition.mastery);
   assert.equal(weakestErrorTypes(afterSuccess)[0], "relationship");
+});
+
+test("continues checkpoint attempts after a closed question", () => {
+  assert.equal(nextCheckpointAttempt(), 1);
+  assert.equal(nextCheckpointAttempt(1), 2);
+  assert.equal(nextCheckpointAttempt(2), 3);
+  assert.equal(nextCheckpointAttempt(3), 3);
 });
 
 test("creates a source-grounded fallback question without an API", () => {

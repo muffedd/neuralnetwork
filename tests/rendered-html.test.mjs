@@ -34,7 +34,7 @@ test("server-renders the graph and reading workspace", async () => {
   assert.match(html, /Start with one node/);
 });
 
-test("keeps the canvas visible and the reading canvas non-interruptive", async () => {
+test("keeps the canvas visible and the reading flow accessible and non-interruptive", async () => {
   const [css, page] = await Promise.all([
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
@@ -44,15 +44,30 @@ test("keeps the canvas visible and the reading canvas non-interruptive", async (
   assert.match(css, /\.graph-wrap\s*>\s*canvas\s*\{[^}]*position:\s*absolute/s);
   assert.match(css, /\.reading-pane\s*\{[^}]*overflow:\s*hidden/s);
   assert.match(css, /\.reading-scroll\s*\{[^}]*overflow-y:\s*scroll/s);
-  assert.match(css, /\.inspector\s*\{[^}]*display:\s*none/s);
+  assert.doesNotMatch(css, /\.inspector\s*\{/s);
+  assert.match(css, /\.reading-paragraph\.unread\s*>\s*p\s*\{\s*color:\s*var\(--muted\)/s);
   assert.match(css, /\.reading-paragraph\.active\s*>\s*p\s*\{[^}]*color:\s*var\(--ink\)/s);
   assert.match(css, /\.reading-paragraph\.read\s*>\s*p\s*\{[^}]*color:\s*color-mix/s);
-  assert.match(css, /\.checkpoint-notice\s*\{[^}]*position:\s*absolute/s);
+  assert.match(css, /\.checkpoint-notice\s*\{[^}]*position:\s*relative/s);
+  assert.doesNotMatch(css, /\.checkpoint-notice\s*\{[^}]*position:\s*absolute/s);
   assert.match(page, /node\.kind === "topic" \? 18/);
   assert.match(page, /\[1\.7,\s*2\.4\]/);
+  assert.match(page, /new IntersectionObserver/);
+  assert.match(page, /readerScrollFrame\.current/);
+  assert.match(page, /activateGraphNode\(node\)/);
+  assert.match(page, /branchEnds\.get\(parentBranchId\)/);
+  assert.match(page, /nextCheckpointAttempt\(checkpointAttempts\[node\.id\]\)/);
+  assert.match(page, /loadStudySession\(\)/);
+  assert.match(page, /saveStudySession\(\{/);
   assert.match(page, /setCheckpointNoticeId\(nextLocked\.id\)/);
   assert.match(page, /container\.scrollTop \+ container\.clientHeight >= container\.scrollHeight - 3/);
-  assert.match(page, /paragraphs\.at\(-1\)/);
   assert.match(page, /aria-label="Close checkpoint"/);
+  assert.match(page, /aria-labelledby="checkpoint-question"/);
+  assert.match(page, /quizCardRef\.current\.querySelectorAll/);
+  assert.doesNotMatch(page, /setDocumentText\(""\)/);
+  assert.ok(
+    page.indexOf("setDocumentText(text)") > page.indexOf("The extracted graph did not pass the quality check"),
+    "replacement text should only commit after graph validation",
+  );
   assert.doesNotMatch(page, /markerTop[^;]+beginCheckpoint\(nextLocked\)/s);
 });
