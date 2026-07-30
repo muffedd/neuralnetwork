@@ -642,11 +642,16 @@ export default function Home() {
 
     const readingLine = container.getBoundingClientRect().top + container.clientHeight * .42;
     let activeIndex = -1;
-    container.querySelectorAll<HTMLElement>("[data-reader-index]").forEach((paragraph) => {
+    const paragraphs = [...container.querySelectorAll<HTMLElement>("[data-reader-index]")];
+    paragraphs.forEach((paragraph) => {
       if (paragraph.getBoundingClientRect().top <= readingLine) {
         activeIndex = Number(paragraph.dataset.readerIndex);
       }
     });
+    const atDocumentEnd = container.scrollTop + container.clientHeight >= container.scrollHeight - 3;
+    if (atDocumentEnd && paragraphs.length) {
+      activeIndex = Number(paragraphs.at(-1)?.dataset.readerIndex);
+    }
     setActiveReaderParagraph(activeIndex);
 
     if (!nextLocked || dismissedCheckpointNotices.current.has(nextLocked.id)) return;

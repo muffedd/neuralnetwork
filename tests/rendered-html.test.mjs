@@ -51,6 +51,8 @@ test("keeps the canvas visible and the reading canvas non-interruptive", async (
   assert.match(page, /node\.kind === "topic" \? 18/);
   assert.match(page, /\[1\.7,\s*2\.4\]/);
   assert.match(page, /setCheckpointNoticeId\(nextLocked\.id\)/);
+  assert.match(page, /container\.scrollTop \+ container\.clientHeight >= container\.scrollHeight - 3/);
+  assert.match(page, /paragraphs\.at\(-1\)/);
   assert.match(page, /aria-label="Close checkpoint"/);
   assert.doesNotMatch(page, /markerTop[^;]+beginCheckpoint\(nextLocked\)/s);
 });
