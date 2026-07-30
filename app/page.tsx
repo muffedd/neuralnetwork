@@ -290,8 +290,8 @@ export default function Home() {
     if (!ctx) return;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = wrap.clientWidth;
-    const height = wrap.clientHeight;
+    const width = Math.max(1, wrap.clientWidth);
+    const height = Math.max(1, wrap.clientHeight);
     const isDark = theme === "dark";
     const nodeInk = isDark ? "#f4f6f5" : "#0a1015";
     const quietInk = isDark ? "#a7afb2" : "#364047";
@@ -326,7 +326,7 @@ export default function Home() {
     const center = focusNode ?? { x: 0, y: 0, z: 0 };
 
     visibleNodes.forEach((node) => {
-      const baseRadius = node.kind === "topic" ? 12 : node.kind === "branch" ? 8 : node.kind === "bridge" ? 6.5 : 5;
+      const baseRadius = node.kind === "topic" ? 18 : node.kind === "branch" ? 8 : node.kind === "bridge" ? 6.5 : 5;
       points.set(node.id, project(node.x - center.x, node.y - center.y, node.z - center.z, baseRadius));
     });
 
@@ -362,7 +362,8 @@ export default function Home() {
       const shared = edge.relation === "shared";
       const emphasized = mode === "all" || (mode === "hierarchy" && !knowledgeLink) || (mode === "bridges" && knowledgeLink);
       ctx.save();
-      ctx.strokeStyle = `rgba(${lineInk},${emphasized ? (knowledgeLink ? ".74" : ".43") : ".1"})`;
+      const sparseGraph = visibleNodes.length < 4;
+      ctx.strokeStyle = `rgba(${lineInk},${emphasized ? (knowledgeLink ? ".74" : ".43") : sparseGraph ? ".28" : ".1"})`;
       ctx.lineWidth = emphasized ? (knowledgeLink ? 1.25 : .8) : .42;
       ctx.setLineDash(knowledgeLink ? (shared ? [4, 4] : [1.5, 3]) : []);
       ctx.beginPath();
@@ -393,6 +394,17 @@ export default function Home() {
         const fragile = nodeProgress[node.id] === "fragile";
         const nodeColor = fragile ? quietInk : nodeInk;
         ctx.save();
+        if (node.kind === "topic") {
+          ctx.strokeStyle = nodeColor;
+          ctx.lineWidth = .75;
+          ctx.globalAlpha = .18;
+          [1.7, 2.4].forEach((ring) => {
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, point.r * ring, 0, Math.PI * 2);
+            ctx.stroke();
+          });
+          ctx.globalAlpha = 1;
+        }
         ctx.shadowColor = nodeColor;
         ctx.shadowBlur = fragile ? 1 : active ? 9 : Math.max(0, 3 - point.z / 90);
         ctx.fillStyle = nodeColor;
@@ -420,10 +432,16 @@ export default function Home() {
   }, [fieldPoints, focusNode, mode, nodeProgress, selected, theme, visibleEdges, visibleNodes]);
 
   useEffect(() => {
-    draw();
-    const resize = new ResizeObserver(draw);
+    let resizeFrame = window.requestAnimationFrame(draw);
+    const resize = new ResizeObserver(() => {
+      window.cancelAnimationFrame(resizeFrame);
+      resizeFrame = window.requestAnimationFrame(draw);
+    });
     if (wrapRef.current) resize.observe(wrapRef.current);
-    return () => resize.disconnect();
+    return () => {
+      window.cancelAnimationFrame(resizeFrame);
+      resize.disconnect();
+    };
   }, [draw]);
 
   const analyzeFile = async (file?: File) => {
@@ -478,6 +496,7 @@ export default function Home() {
       }
       setGraph(nextGraph);
       setAnalysisMode("gemini");
+      setMode("all");
       setSelected("topic");
       setFocusId(null);
       setFlashcardId(null);
